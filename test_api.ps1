@@ -138,12 +138,95 @@ try {
 }
 Write-Host ""
 
-Write-Host "10. 查询直播间商品列表" -ForegroundColor Yellow
+Write-Host "10. 模拟网络波动重复出价（旧锁定自动释放）" -ForegroundColor Yellow
+$dupBidBody = @{
+    product_id = $productId
+    user_id = "user_001"
+    bid_price = 200.0
+    quantity = 3
+} | ConvertTo-Json
+
 try {
-    $products = Invoke-RestMethod -Uri "$BASE_URL/products/room/room_live_001" -Method Get
-    Write-Host "   ✓ 查询成功，直播间共 $($products.Count) 件商品" -ForegroundColor Green
-    foreach ($p in $products) {
-        Write-Host "     - $($p.name): 当前价 $($p.current_price) 元, 库存 $($p.available_stock)/$($p.total_stock)" -ForegroundColor Gray
+    $dupBid = Invoke-RestMethod -Uri "$BASE_URL/bids" -Method Post -Body $dupBidBody -ContentType "application/json"
+    Write-Host "   ✓ 重复出价成功！旧锁定已自动释放" -ForegroundColor Green
+    Write-Host "     新出价ID: $($dupBid.id)" -ForegroundColor Gray
+    Write-Host "     新出价价格: $($dupBid.bid_price) 元" -ForegroundColor Gray
+    Write-Host "     数量: $($dupBid.quantity) 件" -ForegroundColor Gray
+} catch {
+    Write-Host "   ✗ 出价失败: $($_.Exception.Message)" -ForegroundColor Red
+}
+Write-Host ""
+
+Write-Host "11. 重复出价后验证库存（只有最新出价在锁定）" -ForegroundColor Yellow
+try {
+    $product = Invoke-RestMethod -Uri "$BASE_URL/products/$productId" -Method Get
+    Write-Host "   ✓ 查询成功" -ForegroundColor Green
+    Write-Host "     总库存: $($product.total_stock) 件" -ForegroundColor Gray
+    Write-Host "     可用库存: $($product.available_stock) 件" -ForegroundColor Gray
+    Write-Host "     锁定库存: $($product.locked_stock) 件" -ForegroundColor Magenta
+    Write-Host "     说明: 锁定库存应为3件（最新出价），而非5件（双重锁定）" -ForegroundColor Cyan
+} catch {
+    Write-Host "   ✗ 查询失败: $($_.Exception.Message)" -ForegroundColor Red
+}
+Write-Host ""
+
+Write-Host "12. 使用幂等键重复出价（返回同一结果）" -ForegroundColor Yellow
+$idempotencyKey = "request-" + [guid]::NewGuid().ToString()
+$idemBidBody1 = @{
+    product_id = $productId
+    user_id = "user_003"
+    bid_price = 180.0
+    quantity = 1
+    idempotency_key = $idempotencyKey
+} | ConvertTo-Json
+
+try {
+    $bid1 = Invoke-RestMethod -Uri "$BASE_URL/bids" -Method Post -Body $idemBidBody1 -ContentType "application/json"
+    Write-Host "   第一次出价ID: $($bid1.id)" -ForegroundColor Gray
+    
+    $idemBidBody2 = @{
+        product_id = $productId
+        user_id = "user_003"
+        bid_price = 250.0
+        quantity = 5
+        idempotency_key = $idempotencyKey
+    } | ConvertTo-Json
+    
+    $bid2 = Invoke-RestMethod -Uri "$BASE_URL/bids" -Method Post -Body $idemBidBody2 -ContentType "application/json"
+    Write-Host "   第二次出价ID: $($bid2.id)" -ForegroundColor Gray
+    
+    if ($bid1.id -eq $bid2.id) {
+        Write-Host "   ✓ 幂等键生效！两次请求返回同一出价结果" -ForegroundColor Green
+        Write-Host "     价格: $($bid1.bid_price) 元, 数量: $($bid1.quantity) 件" -ForegroundColor Gray
+    } else {
+        Write-Host "   ⚠ 幂等键未生效，返回了不同的出价" -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host "   ✗ 出价失败: $($_.Exception.Message)" -ForegroundColor Red
+}
+Write-Host ""
+
+Write-Host "13. 幂等键测试后验证库存（没有重复锁定）" -ForegroundColor Yellow
+try {
+    $product = Invoke-RestMethod -Uri "$BASE_URL/products/$productId" -Method Get
+    Write-Host "   ✓ 查询成功" -ForegroundColor Green
+    Write-Host "     总库存: $($product.total_stock) 件" -ForegroundColor Gray
+    Write-Host "     可用库存: $($product.available_stock) 件" -ForegroundColor Gray
+    Write-Host "     锁定库存: $($product.locked_stock) 件" -ForegroundColor Magenta
+} catch {
+    Write-Host "   ✗ 查询失败: $($_.Exception.Message)" -ForegroundColor Red
+}
+Write-Host ""
+
+Write-Host "14. 查询商品锁定记录详情" -ForegroundColor Yellow
+try {
+    $locks = Invoke-RestMethod -Uri "$BASE_URL/products/$productId/locks" -Method Get
+    Write-Host "   ✓ 查询成功，共 $($locks.Count) 条锁定记录" -ForegroundColor Green
+    $activeCount = ($locks | Where-Object { $_.status -eq "Active" }).Count
+    Write-Host "     活动锁定: $activeCount 条" -ForegroundColor Cyan
+    foreach ($lock in $locks) {
+        $statusColor = if ($lock.status -eq "Active") { "Green" } else { "Gray" }
+        Write-Host "     - 用户 $($lock.user_id): $($lock.quantity) 件, 状态: $($lock.status)" -ForegroundColor $statusColor
     }
 } catch {
     Write-Host "   ✗ 查询失败: $($_.Exception.Message)" -ForegroundColor Red
@@ -153,3 +236,9 @@ Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  测试完成！" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "防重复出价机制说明:" -ForegroundColor White
+Write-Host "  1. 同一用户同一商品只能有一个活动锁定" -ForegroundColor Gray
+Write-Host "  2. 新出价自动释放旧锁定，防止双重锁定" -ForegroundColor Gray
+Write-Host "  3. 支持幂等键，相同请求ID返回同一结果" -ForegroundColor Gray
+Write-Host "  4. 所有操作在事务内完成，保证原子性" -ForegroundColor Gray

@@ -100,6 +100,21 @@ impl AuctionService {
             ));
         }
 
+        if let Some(ref idempotency_key) = req.idempotency_key {
+            if !idempotency_key.is_empty() {
+                if let Some(existing_bid_id) =
+                    db::get_idempotency_result(&self.pool, idempotency_key).await?
+                {
+                    tracing::info!(
+                        "Idempotency hit: key={}, bid_id={}",
+                        idempotency_key,
+                        existing_bid_id
+                    );
+                    return self.get_bid(existing_bid_id).await;
+                }
+            }
+        }
+
         let product = db::get_product(&self.pool, req.product_id)
             .await?
             .ok_or(AppError::ProductNotFound)?;
@@ -113,11 +128,28 @@ impl AuctionService {
             return Err(AppError::InvalidBidIncrement);
         }
 
-        if product.available_stock < req.quantity {
-            return Err(AppError::InsufficientStock);
+        let mut tx = self.pool.begin().await?;
+
+        let released_count =
+            db::release_user_active_locks(&mut *tx, req.product_id, &req.user_id).await?;
+
+        if released_count > 0 {
+            tracing::info!(
+                "Released {} previous locks for user {} on product {}",
+                released_count,
+                req.user_id,
+                req.product_id
+            );
         }
 
-        let mut tx = self.pool.begin().await?;
+        let product_after_release = db::get_product(&mut *tx, req.product_id)
+            .await?
+            .ok_or(AppError::ProductNotFound)?;
+
+        if product_after_release.available_stock < req.quantity {
+            tx.rollback().await?;
+            return Err(AppError::InsufficientStock);
+        }
 
         let bid = db::create_bid(
             &mut *tx,
@@ -134,15 +166,22 @@ impl AuctionService {
         db::update_product_price(&mut *tx, req.product_id, req.bid_price).await?;
         db::update_bid_status(&mut *tx, bid.id, BidStatus::Confirmed).await?;
 
+        if let Some(ref idempotency_key) = req.idempotency_key {
+            if !idempotency_key.is_empty() {
+                db::set_idempotency_result(&mut *tx, idempotency_key, bid.id).await?;
+            }
+        }
+
         tx.commit().await?;
 
         tracing::info!(
-            "Bid placed: product={}, user={}, price={}, quantity={}, lock_expires={}",
+            "Bid placed: product={}, user={}, price={}, quantity={}, lock_expires={}, released_previous={}",
             req.product_id,
             req.user_id,
             req.bid_price,
             req.quantity,
-            lock.expires_at
+            lock.expires_at,
+            released_count
         );
 
         Ok(BidResponse {
@@ -253,5 +292,9 @@ impl AuctionService {
 
     pub async fn cleanup_expired_locks(&self) -> AppResult<i64> {
         db::expire_old_locks(&self.pool).await
+    }
+
+    pub async fn cleanup_expired_idempotency_keys(&self) -> AppResult<i64> {
+        db::cleanup_expired_idempotency_keys(&self.pool).await
     }
 }

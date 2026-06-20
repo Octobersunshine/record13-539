@@ -349,3 +349,246 @@ async fn test_get_products_by_room() {
     let products = service.get_products_by_room("room_002").await.unwrap();
     assert_eq!(products.len(), 1);
 }
+
+#[tokio::test]
+async fn test_duplicate_bid_releases_old_lock() {
+    let pool = setup_test_db().await;
+    let service = AuctionService::new(pool.clone());
+
+    let req = CreateProductRequest {
+        name: "测试商品".to_string(),
+        description: "测试重复出价自动释放旧锁定".to_string(),
+        total_stock: 100,
+        start_price: 10.0,
+        min_increment: 1.0,
+        room_id: "room_001".to_string(),
+    };
+
+    let product = service.create_product(&req).await.unwrap();
+
+    let bid_req1 = PlaceBidRequest {
+        product_id: product.id,
+        user_id: "user_001".to_string(),
+        bid_price: 15.0,
+        quantity: 3,
+        idempotency_key: None,
+    };
+
+    let bid1 = service.place_bid(&bid_req1).await.unwrap();
+    assert_eq!(bid1.quantity, 3);
+
+    let product_after_first = service.get_product(product.id).await.unwrap();
+    assert_eq!(product_after_first.available_stock, 97);
+    assert_eq!(product_after_first.locked_stock, 3);
+
+    let bid_req2 = PlaceBidRequest {
+        product_id: product.id,
+        user_id: "user_001".to_string(),
+        bid_price: 25.0,
+        quantity: 5,
+        idempotency_key: None,
+    };
+
+    let bid2 = service.place_bid(&bid_req2).await.unwrap();
+    assert_eq!(bid2.bid_price, 25.0);
+    assert_eq!(bid2.quantity, 5);
+    assert_ne!(bid1.id, bid2.id);
+
+    let product_after_second = service.get_product(product.id).await.unwrap();
+    assert_eq!(product_after_second.available_stock, 95);
+    assert_eq!(product_after_second.locked_stock, 5);
+    assert_eq!(product_after_second.total_stock, 100);
+
+    let locks = service.get_product_locks(product.id).await.unwrap();
+    let active_locks: Vec<_> = locks
+        .iter()
+        .filter(|l| l.status == LockStatus::Active)
+        .collect();
+    assert_eq!(active_locks.len(), 1);
+    assert_eq!(active_locks[0].bid_id, bid2.id);
+}
+
+#[tokio::test]
+async fn test_rapid_repeated_bids_no_double_lock() {
+    let pool = setup_test_db().await;
+    let service = std::sync::Arc::new(AuctionService::new(pool.clone()));
+
+    let req = CreateProductRequest {
+        name: "热门商品".to_string(),
+        description: "模拟网络波动快速重复点击".to_string(),
+        total_stock: 100,
+        start_price: 10.0,
+        min_increment: 1.0,
+        room_id: "room_001".to_string(),
+    };
+
+    let product = service.create_product(&req).await.unwrap();
+
+    let mut handles = Vec::new();
+    for i in 0..5 {
+        let service = service.clone();
+        let product_id = product.id;
+        let handle = tokio::spawn(async move {
+            let bid_req = PlaceBidRequest {
+                product_id,
+                user_id: "user_flaky".to_string(),
+                bid_price: 20.0 + (i as f64) * 5.0,
+                quantity: 2,
+                idempotency_key: None,
+            };
+            service.place_bid(&bid_req).await
+        });
+        handles.push(handle);
+    }
+
+    let results = futures::future::join_all(handles).await;
+    let success_count = results
+        .iter()
+        .filter(|r| r.as_ref().unwrap().is_ok())
+        .count();
+
+    assert!(success_count >= 1);
+
+    let final_product = service.get_product(product.id).await.unwrap();
+    assert_eq!(final_product.locked_stock, 2);
+    assert_eq!(final_product.available_stock, 98);
+    assert_eq!(final_product.total_stock, 100);
+
+    let locks = service.get_product_locks(product.id).await.unwrap();
+    let user_locks: Vec<_> = locks
+        .iter()
+        .filter(|l| l.user_id == "user_flaky" && l.status == LockStatus::Active)
+        .collect();
+    assert_eq!(user_locks.len(), 1);
+}
+
+#[tokio::test]
+async fn test_idempotency_key_same_result() {
+    let pool = setup_test_db().await;
+    let service = AuctionService::new(pool.clone());
+
+    let req = CreateProductRequest {
+        name: "测试商品".to_string(),
+        description: "测试幂等键".to_string(),
+        total_stock: 100,
+        start_price: 10.0,
+        min_increment: 1.0,
+        room_id: "room_001".to_string(),
+    };
+
+    let product = service.create_product(&req).await.unwrap();
+
+    let idempotency_key = "req-abc-123".to_string();
+
+    let bid_req1 = PlaceBidRequest {
+        product_id: product.id,
+        user_id: "user_001".to_string(),
+        bid_price: 15.0,
+        quantity: 2,
+        idempotency_key: Some(idempotency_key.clone()),
+    };
+
+    let bid1 = service.place_bid(&bid_req1).await.unwrap();
+
+    let bid_req2 = PlaceBidRequest {
+        product_id: product.id,
+        user_id: "user_001".to_string(),
+        bid_price: 20.0,
+        quantity: 5,
+        idempotency_key: Some(idempotency_key.clone()),
+    };
+
+    let bid2 = service.place_bid(&bid_req2).await.unwrap();
+
+    assert_eq!(bid1.id, bid2.id);
+    assert_eq!(bid1.bid_price, bid2.bid_price);
+    assert_eq!(bid1.quantity, bid2.quantity);
+
+    let final_product = service.get_product(product.id).await.unwrap();
+    assert_eq!(final_product.locked_stock, 2);
+    assert_eq!(final_product.available_stock, 98);
+}
+
+#[tokio::test]
+async fn test_different_users_both_get_locks() {
+    let pool = setup_test_db().await;
+    let service = AuctionService::new(pool.clone());
+
+    let req = CreateProductRequest {
+        name: "测试商品".to_string(),
+        description: "不同用户各自获得锁定".to_string(),
+        total_stock: 100,
+        start_price: 10.0,
+        min_increment: 1.0,
+        room_id: "room_001".to_string(),
+    };
+
+    let product = service.create_product(&req).await.unwrap();
+
+    let bid_req1 = PlaceBidRequest {
+        product_id: product.id,
+        user_id: "user_001".to_string(),
+        bid_price: 15.0,
+        quantity: 2,
+        idempotency_key: None,
+    };
+    service.place_bid(&bid_req1).await.unwrap();
+
+    let bid_req2 = PlaceBidRequest {
+        product_id: product.id,
+        user_id: "user_002".to_string(),
+        bid_price: 20.0,
+        quantity: 3,
+        idempotency_key: None,
+    };
+    service.place_bid(&bid_req2).await.unwrap();
+
+    let final_product = service.get_product(product.id).await.unwrap();
+    assert_eq!(final_product.locked_stock, 5);
+    assert_eq!(final_product.available_stock, 95);
+
+    let locks = service.get_product_locks(product.id).await.unwrap();
+    let active_locks: Vec<_> = locks
+        .iter()
+        .filter(|l| l.status == LockStatus::Active)
+        .collect();
+    assert_eq!(active_locks.len(), 2);
+}
+
+#[tokio::test]
+async fn test_user_bids_on_multiple_products() {
+    let pool = setup_test_db().await;
+    let service = AuctionService::new(pool.clone());
+
+    for i in 0..2 {
+        let req = CreateProductRequest {
+            name: format!("商品{}", i),
+            description: format!("商品{}描述", i),
+            total_stock: 50,
+            start_price: 10.0,
+            min_increment: 1.0,
+            room_id: "room_001".to_string(),
+        };
+        service.create_product(&req).await.unwrap();
+    }
+
+    let products = service.get_products_by_room("room_001").await.unwrap();
+    assert_eq!(products.len(), 2);
+
+    for product in &products {
+        let bid_req = PlaceBidRequest {
+            product_id: product.id,
+            user_id: "user_001".to_string(),
+            bid_price: 15.0,
+            quantity: 2,
+            idempotency_key: None,
+        };
+        service.place_bid(&bid_req).await.unwrap();
+    }
+
+    for product in &products {
+        let p = service.get_product(product.id).await.unwrap();
+        assert_eq!(p.locked_stock, 2);
+        assert_eq!(p.available_stock, 48);
+    }
+}

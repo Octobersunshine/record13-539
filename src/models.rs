@@ -124,6 +124,8 @@ pub struct PlaceBidRequest {
     pub user_id: String,
     pub bid_price: f64,
     pub quantity: i64,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
