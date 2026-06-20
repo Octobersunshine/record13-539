@@ -29,5 +29,15 @@ pub async fn start_expired_locks_cleanup(service: Arc<AuctionService>, interval_
                 tracing::error!("Failed to clean up idempotency keys: {}", e);
             }
         }
+
+        match service.cleanup_ended_auctions().await {
+            Ok(count) if count > 0 => {
+                tracing::info!("Released {} locks from ended auctions", count);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!("Failed to clean up ended auctions: {}", e);
+            }
+        }
     }
 }

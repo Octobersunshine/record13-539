@@ -29,6 +29,7 @@ pub async fn init_db(database_url: &str) -> AppResult<SqlitePool> {
             current_price REAL NOT NULL,
             min_increment REAL NOT NULL,
             room_id TEXT NOT NULL,
+            end_time TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -111,11 +112,22 @@ pub async fn init_db(database_url: &str) -> AppResult<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_products_end_time ON products(end_time)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
     Ok(pool)
 }
 
 pub async fn create_product(pool: &SqlitePool, req: &CreateProductRequest) -> AppResult<Product> {
     let now = Utc::now();
+    let end_time = req
+        .auction_duration_minutes
+        .map(|minutes| now + Duration::minutes(minutes));
     let product = Product {
         id: Uuid::new_v4(),
         name: req.name.clone(),
@@ -127,6 +139,7 @@ pub async fn create_product(pool: &SqlitePool, req: &CreateProductRequest) -> Ap
         current_price: req.start_price,
         min_increment: req.min_increment,
         room_id: req.room_id.clone(),
+        end_time,
         created_at: now,
         updated_at: now,
     };
@@ -134,8 +147,8 @@ pub async fn create_product(pool: &SqlitePool, req: &CreateProductRequest) -> Ap
     sqlx::query(
         r#"
         INSERT INTO products (id, name, description, total_stock, available_stock, locked_stock,
-                              start_price, current_price, min_increment, room_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              start_price, current_price, min_increment, room_id, end_time, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(product.id.to_string())
@@ -148,6 +161,7 @@ pub async fn create_product(pool: &SqlitePool, req: &CreateProductRequest) -> Ap
     .bind(product.current_price)
     .bind(product.min_increment)
     .bind(&product.room_id)
+    .bind(product.end_time.map(|t| t.to_rfc3339()))
     .bind(product.created_at.to_rfc3339())
     .bind(product.updated_at.to_rfc3339())
     .execute(pool)
@@ -666,4 +680,111 @@ pub async fn cleanup_expired_idempotency_keys(pool: &SqlitePool) -> AppResult<i6
     .await?;
 
     Ok(result.rows_affected() as i64)
+}
+
+pub async fn get_ended_auctions_with_active_locks(pool: &SqlitePool) -> AppResult<Vec<Product>> {
+    let now = Utc::now();
+    let products: Vec<Product> = sqlx::query_as::<_, Product>(
+        r#"
+        SELECT DISTINCT p.* FROM products p
+        INNER JOIN stock_locks sl ON p.id = sl.product_id
+        WHERE p.end_time IS NOT NULL 
+          AND p.end_time < ?
+          AND sl.status = 'Active'
+        "#,
+    )
+    .bind(now.to_rfc3339())
+    .fetch_all(pool)
+    .await?;
+
+    Ok(products)
+}
+
+pub async fn release_all_active_locks_for_product(
+    pool: &SqlitePool,
+    product_id: Uuid,
+) -> AppResult<i64> {
+    let mut tx = pool.begin().await?;
+
+    let active_locks: Vec<StockLock> = sqlx::query_as::<_, StockLock>(
+        r#"
+        SELECT * FROM stock_locks 
+        WHERE product_id = ? AND status = 'Active'
+        "#,
+    )
+    .bind(product_id.to_string())
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let count = active_locks.len() as i64;
+
+    for lock in active_locks {
+        sqlx::query(
+            r#"
+            UPDATE stock_locks SET status = 'Expired' WHERE id = ?
+            "#,
+        )
+        .bind(lock.id.to_string())
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE bid_records SET status = 'Expired' WHERE id = ?
+            "#,
+        )
+        .bind(lock.bid_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE products 
+            SET available_stock = available_stock + ?,
+                locked_stock = locked_stock - ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(lock.quantity)
+        .bind(lock.quantity)
+        .bind(Utc::now().to_rfc3339())
+        .bind(lock.product_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+
+        tracing::info!(
+            "Auction ended - releasing lock {} for product {}, user {}, quantity {}",
+            lock.id,
+            lock.product_id,
+            lock.user_id,
+            lock.quantity
+        );
+    }
+
+    tx.commit().await?;
+
+    if count > 0 {
+        tracing::info!(
+            "Released {} active locks for ended auction product {}",
+            count,
+            product_id
+        );
+    }
+
+    Ok(count)
+}
+
+pub async fn get_active_locks_count(pool: &SqlitePool, product_id: Uuid) -> AppResult<i64> {
+    let result: Option<(i64,)> = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM stock_locks 
+        WHERE product_id = ? AND status = 'Active'
+        "#,
+    )
+    .bind(product_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(result.map(|r| r.0).unwrap_or(0))
 }

@@ -14,6 +14,7 @@ pub struct Product {
     pub current_price: f64,
     pub min_increment: f64,
     pub room_id: String,
+    pub end_time: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -26,6 +27,8 @@ pub struct CreateProductRequest {
     pub start_price: f64,
     pub min_increment: f64,
     pub room_id: String,
+    #[serde(default)]
+    pub auction_duration_minutes: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,7 +43,34 @@ pub struct ProductResponse {
     pub current_price: f64,
     pub min_increment: f64,
     pub room_id: String,
+    pub end_time: Option<DateTime<Utc>>,
+    pub auction_status: AuctionStatus,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AuctionStatus {
+    Upcoming,
+    Ongoing,
+    Ended,
+}
+
+impl Product {
+    pub fn get_auction_status(&self) -> AuctionStatus {
+        match self.end_time {
+            None => AuctionStatus::Ongoing,
+            Some(end_time) => {
+                let now = Utc::now();
+                if now < self.created_at {
+                    AuctionStatus::Upcoming
+                } else if now < end_time {
+                    AuctionStatus::Ongoing
+                } else {
+                    AuctionStatus::Ended
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

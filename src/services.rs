@@ -31,6 +31,13 @@ impl AuctionService {
                 "Min increment must be greater than 0".to_string(),
             ));
         }
+        if let Some(duration) = req.auction_duration_minutes {
+            if duration <= 0 {
+                return Err(AppError::InvalidRequest(
+                    "Auction duration must be greater than 0".to_string(),
+                ));
+            }
+        }
 
         let product = db::create_product(&self.pool, req).await?;
         Ok(ProductResponse {
@@ -44,6 +51,8 @@ impl AuctionService {
             current_price: product.current_price,
             min_increment: product.min_increment,
             room_id: product.room_id,
+            end_time: product.end_time,
+            auction_status: product.get_auction_status(),
             created_at: product.created_at,
         })
     }
@@ -64,6 +73,8 @@ impl AuctionService {
             current_price: product.current_price,
             min_increment: product.min_increment,
             room_id: product.room_id,
+            end_time: product.end_time,
+            auction_status: product.get_auction_status(),
             created_at: product.created_at,
         })
     }
@@ -83,6 +94,8 @@ impl AuctionService {
                 current_price: p.current_price,
                 min_increment: p.min_increment,
                 room_id: p.room_id,
+                end_time: p.end_time,
+                auction_status: p.get_auction_status(),
                 created_at: p.created_at,
             })
             .collect())
@@ -118,6 +131,18 @@ impl AuctionService {
         let product = db::get_product(&self.pool, req.product_id)
             .await?
             .ok_or(AppError::ProductNotFound)?;
+
+        let auction_status = product.get_auction_status();
+        if auction_status == AuctionStatus::Ended {
+            return Err(AppError::InvalidRequest(
+                "Auction has ended, cannot place bid".to_string(),
+            ));
+        }
+        if auction_status == AuctionStatus::Upcoming {
+            return Err(AppError::InvalidRequest(
+                "Auction has not started yet".to_string(),
+            ));
+        }
 
         if req.bid_price < product.current_price {
             return Err(AppError::BidPriceTooLow);
@@ -296,5 +321,33 @@ impl AuctionService {
 
     pub async fn cleanup_expired_idempotency_keys(&self) -> AppResult<i64> {
         db::cleanup_expired_idempotency_keys(&self.pool).await
+    }
+
+    pub async fn cleanup_ended_auctions(&self) -> AppResult<i64> {
+        let ended_products = db::get_ended_auctions_with_active_locks(&self.pool).await?;
+        let mut total_released = 0;
+
+        for product in ended_products {
+            let released = db::release_all_active_locks_for_product(&self.pool, product.id).await?;
+            total_released += released;
+
+            if released > 0 {
+                tracing::info!(
+                    "Auction ended for product {} ({}), released {} locks",
+                    product.id,
+                    product.name,
+                    released
+                );
+            }
+        }
+
+        Ok(total_released)
+    }
+
+    pub async fn get_auction_status(&self, product_id: Uuid) -> AppResult<AuctionStatus> {
+        let product = db::get_product(&self.pool, product_id)
+            .await?
+            .ok_or(AppError::ProductNotFound)?;
+        Ok(product.get_auction_status())
     }
 }

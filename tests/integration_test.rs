@@ -592,3 +592,333 @@ async fn test_user_bids_on_multiple_products() {
         assert_eq!(p.available_stock, 48);
     }
 }
+
+#[tokio::test]
+async fn test_create_product_with_auction_duration() {
+    let pool = setup_test_db().await;
+    let service = AuctionService::new(pool);
+
+    let req = CreateProductRequest {
+        name: "限时拍卖商品".to_string(),
+        description: "30分钟后自动结束".to_string(),
+        total_stock: 100,
+        start_price: 10.0,
+        min_increment: 1.0,
+        room_id: "room_001".to_string(),
+        auction_duration_minutes: Some(30),
+    };
+
+    let product = service.create_product(&req).await.unwrap();
+    assert_eq!(product.name, "限时拍卖商品");
+    assert!(product.end_time.is_some());
+    assert_eq!(product.auction_status, AuctionStatus::Ongoing);
+
+    let end_time = product.end_time.unwrap();
+    let expected_end = chrono::Utc::now() + chrono::Duration::minutes(30);
+    assert!((end_time - expected_end).num_seconds().abs() < 5);
+}
+
+#[tokio::test]
+async fn test_create_product_without_duration_no_end_time() {
+    let pool = setup_test_db().await;
+    let service = AuctionService::new(pool);
+
+    let req = CreateProductRequest {
+        name: "常规商品".to_string(),
+        description: "无时间限制".to_string(),
+        total_stock: 100,
+        start_price: 10.0,
+        min_increment: 1.0,
+        room_id: "room_001".to_string(),
+        auction_duration_minutes: None,
+    };
+
+    let product = service.create_product(&req).await.unwrap();
+    assert!(product.end_time.is_none());
+    assert_eq!(product.auction_status, AuctionStatus::Ongoing);
+}
+
+#[tokio::test]
+async fn test_auction_status_transitions() {
+    let pool = setup_test_db().await;
+    let service = AuctionService::new(pool.clone());
+
+    let req = CreateProductRequest {
+        name: "测试商品".to_string(),
+        description: "测试状态变化".to_string(),
+        total_stock: 100,
+        start_price: 10.0,
+        min_increment: 1.0,
+        room_id: "room_001".to_string(),
+        auction_duration_minutes: Some(60),
+    };
+
+    let product = service.create_product(&req).await.unwrap();
+    assert_eq!(product.auction_status, AuctionStatus::Ongoing);
+
+    let status = service.get_auction_status(product.id).await.unwrap();
+    assert_eq!(status, AuctionStatus::Ongoing);
+
+    sqlx::query(
+        r#"
+        UPDATE products SET end_time = ? WHERE id = ?
+        "#,
+    )
+    .bind((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339())
+    .bind(product.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let status = service.get_auction_status(product.id).await.unwrap();
+    assert_eq!(status, AuctionStatus::Ended);
+}
+
+#[tokio::test]
+async fn test_cannot_bid_on_ended_auction() {
+    let pool = setup_test_db().await;
+    let service = AuctionService::new(pool.clone());
+
+    let req = CreateProductRequest {
+        name: "已结束拍卖".to_string(),
+        description: "测试".to_string(),
+        total_stock: 100,
+        start_price: 10.0,
+        min_increment: 1.0,
+        room_id: "room_001".to_string(),
+        auction_duration_minutes: Some(60),
+    };
+
+    let product = service.create_product(&req).await.unwrap();
+
+    sqlx::query(
+        r#"
+        UPDATE products SET end_time = ? WHERE id = ?
+        "#,
+    )
+    .bind((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339())
+    .bind(product.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let bid_req = PlaceBidRequest {
+        product_id: product.id,
+        user_id: "user_001".to_string(),
+        bid_price: 15.0,
+        quantity: 1,
+        idempotency_key: None,
+    };
+
+    let result = service.place_bid(&bid_req).await;
+    assert!(result.is_err());
+
+    let product_after = service.get_product(product.id).await.unwrap();
+    assert_eq!(product_after.locked_stock, 0);
+    assert_eq!(product_after.available_stock, 100);
+}
+
+#[tokio::test]
+async fn test_auction_ended_auto_release_locks() {
+    let pool = setup_test_db().await;
+    let service = AuctionService::new(pool.clone());
+
+    let req = CreateProductRequest {
+        name: "即将结束的拍卖".to_string(),
+        description: "测试".to_string(),
+        total_stock: 100,
+        start_price: 10.0,
+        min_increment: 1.0,
+        room_id: "room_001".to_string(),
+        auction_duration_minutes: Some(60),
+    };
+
+    let product = service.create_product(&req).await.unwrap();
+
+    let bid_req1 = PlaceBidRequest {
+        product_id: product.id,
+        user_id: "user_001".to_string(),
+        bid_price: 15.0,
+        quantity: 2,
+        idempotency_key: None,
+    };
+    service.place_bid(&bid_req1).await.unwrap();
+
+    let bid_req2 = PlaceBidRequest {
+        product_id: product.id,
+        user_id: "user_002".to_string(),
+        bid_price: 20.0,
+        quantity: 3,
+        idempotency_key: None,
+    };
+    service.place_bid(&bid_req2).await.unwrap();
+
+    let product_after_bids = service.get_product(product.id).await.unwrap();
+    assert_eq!(product_after_bids.locked_stock, 5);
+    assert_eq!(product_after_bids.available_stock, 95);
+
+    sqlx::query(
+        r#"
+        UPDATE products SET end_time = ? WHERE id = ?
+        "#,
+    )
+    .bind((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339())
+    .bind(product.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let released = service.cleanup_ended_auctions().await.unwrap();
+    assert_eq!(released, 5);
+
+    let product_final = service.get_product(product.id).await.unwrap();
+    assert_eq!(product_final.locked_stock, 0);
+    assert_eq!(product_final.available_stock, 100);
+    assert_eq!(product_final.total_stock, 100);
+}
+
+#[tokio::test]
+async fn test_ended_auction_with_confirmed_purchases() {
+    let pool = setup_test_db().await;
+    let service = AuctionService::new(pool.clone());
+
+    let req = CreateProductRequest {
+        name: "测试商品".to_string(),
+        description: "测试".to_string(),
+        total_stock: 100,
+        start_price: 10.0,
+        min_increment: 1.0,
+        room_id: "room_001".to_string(),
+        auction_duration_minutes: Some(60),
+    };
+
+    let product = service.create_product(&req).await.unwrap();
+
+    let bid_req1 = PlaceBidRequest {
+        product_id: product.id,
+        user_id: "user_001".to_string(),
+        bid_price: 15.0,
+        quantity: 2,
+        idempotency_key: None,
+    };
+    let bid1 = service.place_bid(&bid_req1).await.unwrap();
+
+    let bid_req2 = PlaceBidRequest {
+        product_id: product.id,
+        user_id: "user_002".to_string(),
+        bid_price: 20.0,
+        quantity: 3,
+        idempotency_key: None,
+    };
+    let bid2 = service.place_bid(&bid_req2).await.unwrap();
+
+    service.confirm_purchase(bid1.id, "user_001").await.unwrap();
+
+    let product_after_confirm = service.get_product(product.id).await.unwrap();
+    assert_eq!(product_after_confirm.total_stock, 98);
+    assert_eq!(product_after_confirm.locked_stock, 3);
+    assert_eq!(product_after_confirm.available_stock, 95);
+
+    sqlx::query(
+        r#"
+        UPDATE products SET end_time = ? WHERE id = ?
+        "#,
+    )
+    .bind((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339())
+    .bind(product.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let released = service.cleanup_ended_auctions().await.unwrap();
+    assert_eq!(released, 3);
+
+    let product_final = service.get_product(product.id).await.unwrap();
+    assert_eq!(product_final.total_stock, 98);
+    assert_eq!(product_final.locked_stock, 0);
+    assert_eq!(product_final.available_stock, 98);
+}
+
+#[tokio::test]
+async fn test_get_ended_auctions_with_active_locks() {
+    use auction_lock_service::db;
+
+    let pool = setup_test_db().await;
+    let service = AuctionService::new(pool.clone());
+
+    let req1 = CreateProductRequest {
+        name: "已结束商品1".to_string(),
+        description: "测试".to_string(),
+        total_stock: 100,
+        start_price: 10.0,
+        min_increment: 1.0,
+        room_id: "room_001".to_string(),
+        auction_duration_minutes: Some(60),
+    };
+    let product1 = service.create_product(&req1).await.unwrap();
+
+    let req2 = CreateProductRequest {
+        name: "进行中商品".to_string(),
+        description: "测试".to_string(),
+        total_stock: 100,
+        start_price: 10.0,
+        min_increment: 1.0,
+        room_id: "room_001".to_string(),
+        auction_duration_minutes: Some(60),
+    };
+    let product2 = service.create_product(&req2).await.unwrap();
+
+    let bid_req1 = PlaceBidRequest {
+        product_id: product1.id,
+        user_id: "user_001".to_string(),
+        bid_price: 15.0,
+        quantity: 2,
+        idempotency_key: None,
+    };
+    service.place_bid(&bid_req1).await.unwrap();
+
+    let bid_req2 = PlaceBidRequest {
+        product_id: product2.id,
+        user_id: "user_001".to_string(),
+        bid_price: 15.0,
+        quantity: 2,
+        idempotency_key: None,
+    };
+    service.place_bid(&bid_req2).await.unwrap();
+
+    sqlx::query(
+        r#"
+        UPDATE products SET end_time = ? WHERE id = ?
+        "#,
+    )
+    .bind((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339())
+    .bind(product1.id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let ended_auctions = db::get_ended_auctions_with_active_locks(&pool)
+        .await
+        .unwrap();
+    assert_eq!(ended_auctions.len(), 1);
+    assert_eq!(ended_auctions[0].id, product1.id);
+}
+
+#[tokio::test]
+async fn test_invalid_auction_duration_rejected() {
+    let pool = setup_test_db().await;
+    let service = AuctionService::new(pool);
+
+    let req = CreateProductRequest {
+        name: "测试商品".to_string(),
+        description: "测试".to_string(),
+        total_stock: 100,
+        start_price: 10.0,
+        min_increment: 1.0,
+        room_id: "room_001".to_string(),
+        auction_duration_minutes: Some(-30),
+    };
+
+    let result = service.create_product(&req).await;
+    assert!(result.is_err());
+}

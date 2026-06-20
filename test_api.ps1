@@ -33,13 +33,41 @@ try {
     Write-Host "     商品名称: $($product.name)" -ForegroundColor Gray
     Write-Host "     起拍价: $($product.start_price) 元" -ForegroundColor Gray
     Write-Host "     库存: $($product.total_stock) 件" -ForegroundColor Gray
+    Write-Host "     拍卖状态: $($product.auction_status)" -ForegroundColor Cyan
+    if ($product.end_time) {
+        Write-Host "     结束时间: $($product.end_time)" -ForegroundColor Gray
+    }
 } catch {
     Write-Host "   ✗ 创建商品失败: $($_.Exception.Message)" -ForegroundColor Red
     exit 1
 }
 Write-Host ""
 
-Write-Host "3. 查询商品信息" -ForegroundColor Yellow
+Write-Host "2.5 创建限时拍卖商品（60分钟后自动结束）" -ForegroundColor Yellow
+$timedProductBody = @{
+    name = "限时秒杀商品"
+    description = "60分钟限时拍卖，结束后自动释放未付款库存"
+    total_stock = 5
+    start_price = 50.0
+    min_increment = 5.0
+    room_id = "room_live_001"
+    auction_duration_minutes = 60
+} | ConvertTo-Json
+
+try {
+    $timedProduct = Invoke-RestMethod -Uri "$BASE_URL/products" -Method Post -Body $timedProductBody -ContentType "application/json"
+    $timedProductId = $timedProduct.id
+    Write-Host "   ✓ 限时拍卖商品创建成功" -ForegroundColor Green
+    Write-Host "     商品ID: $timedProductId" -ForegroundColor Gray
+    Write-Host "     商品名称: $($timedProduct.name)" -ForegroundColor Gray
+    Write-Host "     拍卖状态: $($timedProduct.auction_status)" -ForegroundColor Cyan
+    Write-Host "     结束时间: $($timedProduct.end_time)" -ForegroundColor Magenta
+} catch {
+    Write-Host "   ✗ 创建限时拍卖商品失败: $($_.Exception.Message)" -ForegroundColor Red
+}
+Write-Host ""
+
+Write-Host "4. 查询商品信息" -ForegroundColor Yellow
 try {
     $product = Invoke-RestMethod -Uri "$BASE_URL/products/$productId" -Method Get
     Write-Host "   ✓ 查询成功" -ForegroundColor Green
@@ -51,7 +79,7 @@ try {
 }
 Write-Host ""
 
-Write-Host "4. 用户出价（库存锁定 15 分钟）" -ForegroundColor Yellow
+Write-Host "5. 用户出价（库存锁定 15 分钟）" -ForegroundColor Yellow
 $bidBody = @{
     product_id = $productId
     user_id = "user_001"
@@ -72,7 +100,7 @@ try {
 }
 Write-Host ""
 
-Write-Host "5. 出价后再次查询商品库存" -ForegroundColor Yellow
+Write-Host "6. 出价后再次查询商品库存" -ForegroundColor Yellow
 try {
     $product = Invoke-RestMethod -Uri "$BASE_URL/products/$productId" -Method Get
     Write-Host "   ✓ 查询成功" -ForegroundColor Green
@@ -84,7 +112,7 @@ try {
 }
 Write-Host ""
 
-Write-Host "6. 第二个用户出价（测试价格规则）" -ForegroundColor Yellow
+Write-Host "7. 第二个用户出价（测试价格规则）" -ForegroundColor Yellow
 $bidBody2 = @{
     product_id = $productId
     user_id = "user_002"
@@ -101,7 +129,7 @@ try {
 }
 Write-Host ""
 
-Write-Host "7. 查询商品锁定记录" -ForegroundColor Yellow
+Write-Host "8. 查询商品锁定记录" -ForegroundColor Yellow
 try {
     $locks = Invoke-RestMethod -Uri "$BASE_URL/products/$productId/locks" -Method Get
     Write-Host "   ✓ 查询成功，共 $($locks.Count) 条锁定记录" -ForegroundColor Green
@@ -113,7 +141,7 @@ try {
 }
 Write-Host ""
 
-Write-Host "8. 确认购买（扣除库存）" -ForegroundColor Yellow
+Write-Host "9. 确认购买（扣除库存）" -ForegroundColor Yellow
 $confirmBody = @{
     user_id = "user_001"
 } | ConvertTo-Json
@@ -126,7 +154,7 @@ try {
 }
 Write-Host ""
 
-Write-Host "9. 确认购买后查询商品库存" -ForegroundColor Yellow
+Write-Host "10. 确认购买后查询商品库存" -ForegroundColor Yellow
 try {
     $product = Invoke-RestMethod -Uri "$BASE_URL/products/$productId" -Method Get
     Write-Host "   ✓ 查询成功" -ForegroundColor Green
@@ -138,7 +166,7 @@ try {
 }
 Write-Host ""
 
-Write-Host "10. 模拟网络波动重复出价（旧锁定自动释放）" -ForegroundColor Yellow
+Write-Host "11. 模拟网络波动重复出价（旧锁定自动释放）" -ForegroundColor Yellow
 $dupBidBody = @{
     product_id = $productId
     user_id = "user_001"
@@ -157,7 +185,7 @@ try {
 }
 Write-Host ""
 
-Write-Host "11. 重复出价后验证库存（只有最新出价在锁定）" -ForegroundColor Yellow
+Write-Host "12. 重复出价后验证库存（只有最新出价在锁定）" -ForegroundColor Yellow
 try {
     $product = Invoke-RestMethod -Uri "$BASE_URL/products/$productId" -Method Get
     Write-Host "   ✓ 查询成功" -ForegroundColor Green
@@ -170,7 +198,7 @@ try {
 }
 Write-Host ""
 
-Write-Host "12. 使用幂等键重复出价（返回同一结果）" -ForegroundColor Yellow
+Write-Host "13. 使用幂等键重复出价（返回同一结果）" -ForegroundColor Yellow
 $idempotencyKey = "request-" + [guid]::NewGuid().ToString()
 $idemBidBody1 = @{
     product_id = $productId
@@ -206,7 +234,7 @@ try {
 }
 Write-Host ""
 
-Write-Host "13. 幂等键测试后验证库存（没有重复锁定）" -ForegroundColor Yellow
+Write-Host "14. 幂等键测试后验证库存（没有重复锁定）" -ForegroundColor Yellow
 try {
     $product = Invoke-RestMethod -Uri "$BASE_URL/products/$productId" -Method Get
     Write-Host "   ✓ 查询成功" -ForegroundColor Green
@@ -218,7 +246,7 @@ try {
 }
 Write-Host ""
 
-Write-Host "14. 查询商品锁定记录详情" -ForegroundColor Yellow
+Write-Host "15. 查询商品锁定记录详情" -ForegroundColor Yellow
 try {
     $locks = Invoke-RestMethod -Uri "$BASE_URL/products/$productId/locks" -Method Get
     Write-Host "   ✓ 查询成功，共 $($locks.Count) 条锁定记录" -ForegroundColor Green
@@ -242,3 +270,10 @@ Write-Host "  1. 同一用户同一商品只能有一个活动锁定" -Foregroun
 Write-Host "  2. 新出价自动释放旧锁定，防止双重锁定" -ForegroundColor Gray
 Write-Host "  3. 支持幂等键，相同请求ID返回同一结果" -ForegroundColor Gray
 Write-Host "  4. 所有操作在事务内完成，保证原子性" -ForegroundColor Gray
+Write-Host ""
+Write-Host "拍卖超时自动落幕机制说明:" -ForegroundColor White
+Write-Host "  1. 创建商品时可设置 auction_duration_minutes 指定拍卖时长" -ForegroundColor Gray
+Write-Host "  2. 拍卖结束后自动释放所有未付款的库存锁定" -ForegroundColor Gray
+Write-Host "  3. 已确认购买的订单不受影响，库存正常扣减" -ForegroundColor Gray
+Write-Host "  4. 后台定时任务每分钟扫描已结束的拍卖" -ForegroundColor Gray
+Write-Host "  5. 拍卖结束后禁止继续出价" -ForegroundColor Gray
